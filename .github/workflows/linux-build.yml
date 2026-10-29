@@ -13,7 +13,6 @@ jobs:
     env:
       GO_SOURCE_DIR: ${{ github.workspace }}/.go-upstream
       OUTPUT_DIR: ${{ github.workspace }}/out
-      VENV_DIR: ${{ runner.temp }}/rg-venv
     steps:
       - name: Checkout Python package
         uses: actions/checkout@v4
@@ -37,6 +36,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      # ``runner`` is not an available context in job-level ``env``, so the
+      # throwaway venv path is exported from a step instead. It lives outside
+      # the checkout so it can never be picked up by the staging allowlist.
+      - name: Export venv path
+        run: echo "VENV_DIR=$RUNNER_TEMP/rg-venv" >> "$GITHUB_ENV"
 
       - name: Install packaging tools
         run: python -m pip install --upgrade "setuptools>=70.1" build
