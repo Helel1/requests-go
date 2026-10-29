@@ -1,6 +1,10 @@
-# Requests-Go: 终极HTTP请求库
+# requests-go（Helel1 维护版）
 
-**Requests-Go** 是一个为现代网络爬虫和自动化任务而生的、功能强大的Python HTTP客户端库。它巧妙地结合了Python `requests`库的易用性与Go语言底层网络栈的高性能和高可定制性，专门用于解决TLS指纹（如JA3/JA4）识别、HTTP/2自定义以及绕过高级机器人检测等难题。
+本仓库是 [`Helel1/requests-go`](https://github.com/Helel1/requests-go)，上游
+[`wangluozhe/requests-go`](https://github.com/wangluozhe/requests-go) 的维护分支：保留
+`requests` 风格的 API 与 TLS/HTTP2 指纹定制能力（JA3/JA4、HTTP/2 帧与扩展、异步接口），
+并在其基础上修复连接池与会话生命周期、Cookie/Header 解析、异常路径资源释放等问题；
+Go 内核改由本人 fork 编译，不再使用上游预编译库。
 
 
 > **维护版状态（maintenance build）**
@@ -35,23 +39,32 @@
 
 ## 安装
 
-通过pip轻松安装：
+本维护版**未发布到 PyPI**：`pip install requests-go` 装到的是 PyPI 上由上游作者发布的同名包，
+内核库与本仓库不同，不能替代本维护版。请在 Linux x86_64 上先构建 wheel，再安装：
 
 ```bash
-pip install requests-go
+python -m tools.build_go_lib <go_repo_dir> <output_dir>
+pip install <output_dir>/dist/requests_go-*.whl
 ```
 
-
-## 加入微信群聊
-如果你想跟更多志同道合的人一起学习，那么加入群聊来吧！(备注：加群)
-
-![微信群聊](./wechat.jpg)
+当前只有 **Linux x86_64 (amd64)** 内核库参与构建；仓库里其它平台的旧二进制未重建，也不在
+wheel 内。
 
 
-## 获取付费版tls_config包
-付费版的tls_config包内置300个指纹（后续会一直更新），各种浏览器和手机指纹（chrome，edge，firefox，safari，opera，ie，okhttp，reqable，各种第三方浏览器百度，小米，华为，vivo等），安装后无缝衔接requests-go，不需要任何操作，获取方式添加上方微信号。
+## 构建、Go 内核与测试
 
-![私有tls_config包](./tls_config.png)
+- **Go 内核关联**：内核库由 [`Helel1/requests`](https://github.com/Helel1/requests) 固定
+  commit `8ddcf6496005c5cb9acaf3f18d38159b7ef43269` 编译，只作本 Python 包的 c-shared
+  内核使用（`go build -buildmode=c-shared`）。该 fork 的 module path 仍是
+  `github.com/wangluozhe/requests`，**不是**新的 `go get` 模块路径，本仓库也不通过
+  `go get` 分发内核。
+- **构建**：`python -m tools.build_go_lib <go_repo_dir> <output_dir>` 需要 Go 1.24.0 与已
+  包含该固定 commit 的 Go 源仓，输出内核库、Go 源码快照、`build_info.json`、build stage
+  与 wheel；`setup.py` 拒绝直接从源码树打包。
+- **测试**：在 build stage 或已安装环境中运行 `python -m unittest discover -s tests -v`；
+  Go 回归测试在构建输出的 `go-src/` 目录运行 `go test -race -count=1 .`。
+- 复现细节、内核来源更新流程与已知边界见 [docs/maintenance.md](./docs/maintenance.md)，
+  版本变更见 [CHANGELOG.md](./CHANGELOG.md)。
 
 
 ## 快速上手
@@ -620,9 +633,7 @@ print(response.text)
 ```
 
 
-### 打包python项目
-```bash
-python setup.py install
-python setup.py build
-python setup.py sdist
-```
+### 打包说明
+本维护版不从源码树直接打包：`setup.py` 要求存在 `requests_go/_build_info.json`，因此只能在
+`python -m tools.build_go_lib` 生成的 build stage 里打包，流程见
+[docs/maintenance.md](./docs/maintenance.md)。
