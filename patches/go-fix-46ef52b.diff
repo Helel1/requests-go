@@ -1,0 +1,789 @@
+diff --git a/libs_dist/export.go b/libs_dist/export.go
+index af75fee..8ba53ff 100644
+--- a/libs_dist/export.go
++++ b/libs_dist/export.go
+@@ -29,7 +29,6 @@ import (
+ 
+ var unsafePointers = make(map[string]*C.char)
+ var unsafePointersLock = sync.Mutex{}
+-var errorFormat = "{\"err\": \"%v\"}"
+ 
+ var sessionsPool = sync.Map{}
+ 
+@@ -37,41 +36,101 @@ var sessionsPool = sync.Map{}
+ type StreamEntry struct {
+ 	Response *models.Response
+ 	Body     io.ReadCloser
++	// owner 用于在流结束时给已关闭的会话做一次最终 idle 清理：Session.Close
++	// 时本流还占着连接（chttp 不打断 in-use 连接），连接回到 idle 是流结束之后的事。
++	owner *requests.Session
++	mu     sync.Mutex
++	closed bool
++}
++
++// finishLocked 关闭 body 并清理已关闭会话的空闲连接。调用方必须持有 e.mu；
++// 重复调用是幂等的。
++func (e *StreamEntry) finishLocked() {
++	if e.closed {
++		return
++	}
++	e.closed = true
++	if e.Body != nil {
++		e.Body.Close()
++	}
++	if e.owner != nil && e.owner.IsClosed() {
++		e.owner.CloseIdleConnections()
++	}
+ }
+ 
+ var streamPool = sync.Map{}
+ 
++// GetSession 按 id 取会话，不存在则新建。cookie jar 由 NewSession 建立并在
++// 会话内保留；这里不再每请求替换它，避免与并发请求读 jar 指针产生竞态。
+ func GetSession(id string) *requests.Session {
+-	cookies, _ := cookiejar.New(nil)
+ 	if actual, ok := sessionsPool.Load(id); ok {
+-		s := actual.(*requests.Session)
+-		s.Cookies = cookies
+-		return s
++		return actual.(*requests.Session)
+ 	}
+ 	s := requests.NewSession()
+-	s.Cookies = cookies
+ 	actual, _ := sessionsPool.LoadOrStore(id, s)
+ 	return actual.(*requests.Session)
+ }
+ 
++// registerCString 把已序列化的 JSON 拷成 C 字符串并按 key 登记，之后由
++// freeMemory(key) 释放。
++func registerCString(key string, encoded []byte) *C.char {
++	ptr := C.CString(string(encoded))
++	unsafePointersLock.Lock()
++	unsafePointers[key] = ptr
++	unsafePointersLock.Unlock()
++	return ptr
++}
++
++// replaceCString 与 registerCString 相同，但先释放该 key 上一次的指针。
++// stream_read 使用 "streamId_read" 单槽协议，旧指针必须在这里回收。
++func replaceCString(key string, encoded []byte) *C.char {
++	ptr := C.CString(string(encoded))
++	unsafePointersLock.Lock()
++	if old, exists := unsafePointers[key]; exists && old != nil {
++		C.free(unsafe.Pointer(old))
++	}
++	unsafePointers[key] = ptr
++	unsafePointersLock.Unlock()
++	return ptr
++}
++
++// cErr 把错误编码成 {"err": ..., "id": ...} 并按 id 登记指针，让 Python 的
++// freeMemory(id) 与成功响应走同一条释放路径。json.Marshal 保证错误文本里的
++// 引号/反斜杠/换行不会产出非法 JSON。
++func cErr(prefix string, err error) *C.char {
++	message := prefix
++	if err != nil {
++		if message != "" {
++			message += ": "
++		}
++		message += err.Error()
++	}
++	id := uuid.New().String()
++	encoded, marshalErr := json.Marshal(map[string]interface{}{"err": message, "id": id})
++	if marshalErr != nil {
++		encoded = []byte(`{"err": "json.Marshal failed", "id": "` + id + `"}`)
++	}
++	return registerCString(id, encoded)
++}
++
+ //export request
+ func request(requestParamsChar *C.char) *C.char {
+ 	requestParamsString := C.GoString(requestParamsChar)
+ 	requestParams := libs.RequestParams{}
+ 	err := json.Unmarshal([]byte(requestParamsString), &requestParams)
+ 	if err != nil {
+-		return C.CString(fmt.Sprintf(errorFormat, "request->err := json.Unmarshal([]byte(requestParamsString), &requestParams) failed: "+err.Error()))
++		return cErr("request->err := json.Unmarshal([]byte(requestParamsString), &requestParams) failed", err)
+ 	}
+ 
+ 	req, err := buildRequest(requestParams)
+ 	if err != nil {
+-		return C.CString(fmt.Sprintf(errorFormat, "request->req, err := buildRequest(requestParams) failed: "+err.Error()))
++		return cErr("request->req, err := buildRequest(requestParams) failed", err)
+ 	}
+ 
+ 	session := GetSession(requestParams.Id)
+ 	response, err := session.Request(requestParams.Method, requestParams.Url, req)
+ 	if err != nil {
+-		return C.CString(fmt.Sprintf(errorFormat, "request->response, err := GetSession(requestParams.Id).Request(requestParams.Method, requestParams.Url, req) failed: "+err.Error()))
++		return cErr("request->response, err := GetSession(requestParams.Id).Request(requestParams.Method, requestParams.Url, req) failed", err)
+ 	}
+ 	defer response.Body.Close()
+ 
+@@ -86,15 +145,9 @@ func request(requestParamsChar *C.char) *C.char {
+ 
+ 	responseParamsString, err := json.Marshal(responseParams)
+ 	if err != nil {
+-		return C.CString(fmt.Sprintf(errorFormat, "request->responseParamsString, err := json.Marshal(responseParams) failed: "+err.Error()))
++		return cErr("request->responseParamsString, err := json.Marshal(responseParams) failed", err)
+ 	}
+-	responseString := C.CString(string(responseParamsString))
+-
+-	unsafePointersLock.Lock()
+-	unsafePointers[responseParams["id"].(string)] = responseString
+-	defer unsafePointersLock.Unlock()
+-
+-	return responseString
++	return registerCString(responseParams["id"].(string), responseParamsString)
+ }
+ 
+ func buildRequest(requestParams libs.RequestParams) (*url.Request, error) {
+@@ -220,6 +273,9 @@ func buildRequest(requestParams libs.RequestParams) (*url.Request, error) {
+ 	if requestParams.Stream {
+ 		req.Stream = true
+ 	}
++	// DLL 调用方（Python）每请求都传入完整的 cookie 状态：会话自累积的 jar
++	// 不能再合并进来，否则 Python 侧清掉的 cookie 会被补回。
++	req.IsolatedCookies = true
+ 	return req, nil
+ }
+ 
+@@ -231,23 +287,24 @@ func freeMemory(responseId *C.char) {
+ 	defer unsafePointersLock.Unlock()
+ 
+ 	ptr, ok := unsafePointers[responseIdString]
+-
+ 	if !ok {
+-		fmt.Println("freeMemory:", ok)
+ 		return
+ 	}
++	delete(unsafePointers, responseIdString)
+ 
+ 	if ptr != nil {
+-		defer C.free(unsafe.Pointer(ptr))
++		C.free(unsafe.Pointer(ptr))
+ 	}
+-
+-	delete(unsafePointers, responseIdString)
+ }
+ 
+ //export freeSession
+ func freeSession(sessionId *C.char) {
+ 	sessionIdString := C.GoString(sessionId)
+-	sessionsPool.Delete(sessionIdString)
++	if actual, loaded := sessionsPool.LoadAndDelete(sessionIdString); loaded {
++		if session, ok := actual.(*requests.Session); ok && session != nil {
++			session.Close()
++		}
++	}
+ }
+ 
+ //export setDebug
+@@ -261,7 +318,7 @@ func stream_request(requestParamsChar *C.char) *C.char {
+ 	requestParams := libs.RequestParams{}
+ 	err := json.Unmarshal([]byte(requestParamsString), &requestParams)
+ 	if err != nil {
+-		return C.CString(fmt.Sprintf(errorFormat, "stream_request->json.Unmarshal failed: "+err.Error()))
++		return cErr("stream_request->json.Unmarshal failed", err)
+ 	}
+ 
+ 	// 强制开启 Stream 模式
+@@ -269,41 +326,39 @@ func stream_request(requestParamsChar *C.char) *C.char {
+ 
+ 	req, err := buildRequest(requestParams)
+ 	if err != nil {
+-		return C.CString(fmt.Sprintf(errorFormat, "stream_request->buildRequest failed: "+err.Error()))
++		return cErr("stream_request->buildRequest failed", err)
+ 	}
+ 
+ 	session := GetSession(requestParams.Id)
+ 	response, err := session.Request(requestParams.Method, requestParams.Url, req)
+ 	if err != nil {
+-		return C.CString(fmt.Sprintf(errorFormat, "stream_request->session.Request failed: "+err.Error()))
++		return cErr("stream_request->session.Request failed", err)
+ 	}
+ 
+-	// 生成 stream_id，将 response 存入流连接池（不关闭 body）
+-	streamId := uuid.New().String()
+-	streamPool.Store(streamId, &StreamEntry{
+-		Response: response,
+-		Body:     response.Body,
+-	})
+-
+ 	// 返回元信息（不包含 body 内容）
+ 	responseParams := make(map[string]interface{})
+-	responseParams["stream_id"] = streamId
+ 	responseParams["url"] = response.Url
+ 	responseParams["headers"] = response.Headers
+ 	responseParams["cookies"] = response.Cookies
+ 	responseParams["status_code"] = response.StatusCode
+ 
++	// 生成 stream_id，先序列化再登记 entry：序列化失败时不能把 body/entry 留在池里。
++	streamId := uuid.New().String()
++	responseParams["stream_id"] = streamId
+ 	responseParamsString, err := json.Marshal(responseParams)
+ 	if err != nil {
+-		return C.CString(fmt.Sprintf(errorFormat, "stream_request->json.Marshal failed: "+err.Error()))
++		if response.Body != nil {
++			response.Body.Close()
++		}
++		return cErr("stream_request->json.Marshal failed", err)
+ 	}
+-	responseString := C.CString(string(responseParamsString))
+-
+-	unsafePointersLock.Lock()
+-	unsafePointers[streamId] = responseString
+-	defer unsafePointersLock.Unlock()
++	streamPool.Store(streamId, &StreamEntry{
++		Response: response,
++		Body:     response.Body,
++		owner:    session,
++	})
+ 
+-	return responseString
++	return registerCString(streamId, responseParamsString)
+ }
+ 
+ //export stream_read
+@@ -312,10 +367,17 @@ func stream_read(streamIdChar *C.char, size C.int) *C.char {
+ 
+ 	entry, ok := streamPool.Load(streamId)
+ 	if !ok {
+-		return C.CString(fmt.Sprintf(errorFormat, "stream_read->stream not found: "+streamId))
++		return cErr("stream_read->stream not found: "+streamId, nil)
+ 	}
+ 
+ 	streamEntry := entry.(*StreamEntry)
++	streamEntry.mu.Lock()
++	defer streamEntry.mu.Unlock()
++
++	if streamEntry.closed || streamEntry.Body == nil {
++		return cErr("stream_read->stream is closed: "+streamId, nil)
++	}
++
+ 	bufSize := int(size)
+ 	if bufSize <= 0 {
+ 		bufSize = 4096
+@@ -325,70 +387,55 @@ func stream_read(streamIdChar *C.char, size C.int) *C.char {
+ 	n, err := streamEntry.Body.Read(buf)
+ 
+ 	result := make(map[string]interface{})
++	result["data"] = ""
++	result["eof"] = false
+ 	if n > 0 {
+ 		result["data"] = utils.Base64Encode(buf[:n])
+-	} else {
+-		result["data"] = ""
+ 	}
+ 
+-	if err == io.EOF {
++	if err != nil {
++		// EOF 或读错误都结束这个流；已读到的 n 字节仍照常返回，不能丢末尾数据。
+ 		result["eof"] = true
+-	} else if err != nil {
+-		return C.CString(fmt.Sprintf(errorFormat, "stream_read->Read failed: "+err.Error()))
+-	} else {
+-		result["eof"] = false
++		if err != io.EOF {
++			result["err"] = "stream_read->Read failed: " + err.Error()
++		}
++		streamEntry.finishLocked()
+ 	}
+ 
+ 	resultString, err := json.Marshal(result)
+ 	if err != nil {
+-		return C.CString(fmt.Sprintf(errorFormat, "stream_read->json.Marshal failed: "+err.Error()))
++		return cErr("stream_read->json.Marshal failed", err)
+ 	}
+ 
+-	// stream_read 返回的指针用 stream_id + "_read" 作为 key 管理
+-	// 每次调用会覆盖上一次的指针，避免内存泄漏
+-	readKey := streamId + "_read"
+-	unsafePointersLock.Lock()
+-	if oldPtr, exists := unsafePointers[readKey]; exists && oldPtr != nil {
+-		C.free(unsafe.Pointer(oldPtr))
+-	}
+-	responseString := C.CString(string(resultString))
+-	unsafePointers[readKey] = responseString
+-	unsafePointersLock.Unlock()
+-
+-	return responseString
++	// stream_read 返回的指针用 stream_id + "_read" 作为 key 管理，
++	// 每次调用会释放上一次的指针，避免内存泄漏。
++	return replaceCString(streamId+"_read", resultString)
+ }
+ 
+ //export stream_close
+ func stream_close(streamIdChar *C.char) {
+ 	streamId := C.GoString(streamIdChar)
+ 
+-	entry, ok := streamPool.Load(streamId)
++	// LoadAndDelete 保证并发/重复 close 只有一次拿到 entry，关 body 是幂等的。
++	entry, ok := streamPool.LoadAndDelete(streamId)
+ 	if !ok {
+ 		return
+ 	}
+ 
+ 	streamEntry := entry.(*StreamEntry)
+-	if streamEntry.Body != nil {
+-		streamEntry.Body.Close()
+-	}
+-
+-	streamPool.Delete(streamId)
++	streamEntry.mu.Lock()
++	streamEntry.finishLocked()
++	streamEntry.mu.Unlock()
+ 
+ 	// 清理相关的 unsafePointers
+ 	unsafePointersLock.Lock()
+ 	defer unsafePointersLock.Unlock()
+ 
+-	// 清理 stream_id 对应的指针
+-	if ptr, exists := unsafePointers[streamId]; exists && ptr != nil {
+-		C.free(unsafe.Pointer(ptr))
+-		delete(unsafePointers, streamId)
+-	}
+-
+-	// 清理 stream_read 对应的指针
+-	readKey := streamId + "_read"
+-	if ptr, exists := unsafePointers[readKey]; exists && ptr != nil {
+-		C.free(unsafe.Pointer(ptr))
+-		delete(unsafePointers, readKey)
++	for _, key := range []string{streamId, streamId + "_read"} {
++		if ptr, exists := unsafePointers[key]; exists && ptr != nil {
++			C.free(unsafe.Pointer(ptr))
++		}
++		delete(unsafePointers, key)
+ 	}
+ }
+ 
+diff --git a/models/Request.go b/models/Request.go
+index 2b9487f..11fca36 100644
+--- a/models/Request.go
++++ b/models/Request.go
+@@ -19,6 +19,8 @@ type Request struct {
+ 	Body    io.Reader
+ 	Json    any
+ 	Auth    []string
++	// IsolatedCookies 见 url.Request.IsolatedCookies。
++	IsolatedCookies bool
+ }
+ 
+ func (req *Request) Prepare() *PrepareRequest {
+diff --git a/sessions.go b/sessions.go
+index 00fbcc5..161811f 100644
+--- a/sessions.go
++++ b/sessions.go
+@@ -16,6 +16,7 @@ import (
+ 	"strconv"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/andybalholm/brotli"
+@@ -54,13 +55,18 @@ func default_headers() *http.Header {
+ 
+ // 合并cookies
+ func merge_cookies(rawurl string, cookieJar *cookiejar.Jar, cookie *cookiejar.Jar) {
+-	urls, _ := url2.Parse(utils.EncodeURI(rawurl))
+-
+ 	// 防止因为传入 nil 对象导致程序崩溃
+ 	if cookieJar == nil || cookie == nil {
+ 		return
+ 	}
+ 
++	urls, err := url2.Parse(utils.EncodeURI(rawurl))
++	if err != nil || urls == nil {
++		// URL 解析不出 host 时没有可匹配的 cookie 域；cookiejar 对 nil URL
++		// 会解引用崩溃，而调用方随后本来就会因无效 URL 返回错误。
++		return
++	}
++
+ 	// cookieJar的name表
+ 	var cookieJarNames = make(map[string]struct{})
+ 	for _, c := range cookieJar.Cookies(urls) {
+@@ -256,6 +262,40 @@ type Session struct {
+ 	transport      *http.Transport
+ 	transportCache map[string]*http.Transport
+ 	cacheLock      sync.Mutex
++	closed         atomic.Bool // Close() 后置位，只用于幂等与“会话已关闭”判定
++}
++
++// CloseIdleConnections 关闭会话已缓存 transport 的空闲连接。
++// 进行中的请求不受影响（chttp 的 CloseIdleConnections 不打断 in-use 连接）。
++// 基础 transport 只是 Clone 的模板，从不承载请求，因此无需清理。
++func (s *Session) CloseIdleConnections() {
++	s.cacheLock.Lock()
++	transports := make([]*http.Transport, 0, len(s.transportCache))
++	for _, tr := range s.transportCache {
++		if tr != nil {
++			transports = append(transports, tr)
++		}
++	}
++	s.cacheLock.Unlock()
++
++	// 锁外清理：不持 cacheLock 做可能阻塞的收尾工作。
++	for _, tr := range transports {
++		tr.CloseIdleConnections()
++	}
++}
++
++// Close 释放会话持有的连接资源并标记会话已关闭。重复调用是幂等的。
++// 已返回的响应/流仍可读；它们自己的连接会在读完/关闭后再被清理。
++func (s *Session) Close() {
++	if s.closed.Swap(true) {
++		return
++	}
++	s.CloseIdleConnections()
++}
++
++// IsClosed 报告会话是否已 Close。
++func (s *Session) IsClosed() bool {
++	return s.closed.Load()
+ }
+ 
+ // Use 添加中间件
+@@ -279,7 +319,9 @@ func (s *Session) Prepare_request(request *models.Request) (*models.PrepareReque
+ 	}
+ 	cookies, _ := cookiejar.New(nil)
+ 	merge_cookies(request.Url, cookies, c)
+-	merge_cookies(request.Url, cookies, s.Cookies)
++	if !request.IsolatedCookies {
++		merge_cookies(request.Url, cookies, s.Cookies)
++	}
+ 	auth := merge_setting(request.Auth, s.Auth).([]string)
+ 	p := models.NewPrepareRequest()
+ 	err = p.Prepare(
+@@ -306,16 +348,17 @@ func (s *Session) Request(method, rawurl string, request *url.Request) (*models.
+ 		request = url.NewRequest()
+ 	}
+ 	req := &models.Request{
+-		Method:  strings.ToUpper(method),
+-		Url:     rawurl,
+-		Params:  request.GetParams(),
+-		Headers: request.GetHeaders(),
+-		Cookies: request.GetCookies(rawurl),
+-		Data:    request.GetData(),
+-		Files:   request.GetFiles(),
+-		Json:    request.Json,
+-		Body:    request.GetBody(),
+-		Auth:    request.Auth,
++		Method:          strings.ToUpper(method),
++		Url:             rawurl,
++		Params:          request.GetParams(),
++		Headers:         request.GetHeaders(),
++		Cookies:         request.GetCookies(rawurl),
++		Data:            request.GetData(),
++		Files:           request.GetFiles(),
++		Json:            request.Json,
++		Body:            request.GetBody(),
++		Auth:            request.Auth,
++		IsolatedCookies: request.IsolatedCookies,
+ 	}
+ 	preq, err := s.Prepare_request(req)
+ 	if err != nil {
+@@ -406,7 +449,12 @@ func (s *Session) Send(preq *models.PrepareRequest, req *url.Request) (*models.R
+ 	// 设置http2
+ 	http2Settings := merge_setting(req.HTTP2Settings, s.HTTP2Settings).(*http.HTTP2Settings)
+ 	if http2Settings != nil && http2Settings.HeadersID == 0 {
+-		http2Settings.HeadersID = 1
++		// 只在局部副本上补默认值：merge_setting 在 req 未设置时直接返回
++		// s.HTTP2Settings 指针，写它就是写共享的会话字段（并发写竞态）。
++		// 副本只改标量 HeadersID，切片/指针字段仍只读共享。
++		withDefault := *http2Settings
++		withDefault.HeadersID = 1
++		http2Settings = &withDefault
+ 	}
+ 
+ 	// --- 缓存逻辑开始 ---
+@@ -665,7 +713,7 @@ func (s *Session) buildResponse(resp *http.Response, preq *models.PrepareRequest
+ 	}
+ 
+ 	// 更新 Cookies
+-	if resp.Cookies() != nil {
++	if req != nil && !req.IsolatedCookies && resp.Cookies() != nil {
+ 		u, _ := url2.Parse(preq.Url)
+ 		s.Cookies.SetCookies(u, resp.Cookies())
+ 	}
+diff --git a/url/Cookies.go b/url/Cookies.go
+index a1125ce..4d69f68 100644
+--- a/url/Cookies.go
++++ b/url/Cookies.go
+@@ -67,7 +67,7 @@ func parseMapCookies(cookies map[string]interface{}) []*http.Cookie {
+ }
+ 
+ func ParseCookies(rawurl string, cookies interface{}) *cookiejar.Jar {
+-	urls, _ := url.Parse(rawurl)
++	urls, err := url.Parse(rawurl)
+ 	jar := NewCookies()
+ 	var cookieList []*http.Cookie
+ 
+@@ -84,6 +84,11 @@ func ParseCookies(rawurl string, cookies interface{}) *cookiejar.Jar {
+ 		cookieList = parseMapCookies(v)
+ 	}
+ 
++	if err != nil || urls == nil {
++		// URL 解析不出 host 时没有可匹配的 cookie 域（且 cookiejar 对 nil URL
++		// 会崩溃）；调用方随后会因无效 URL 返回错误。
++		return jar
++	}
+ 	jar.SetCookies(urls, cookieList)
+ 	return jar
+ }
+diff --git a/url/Request.go b/url/Request.go
+index 54c7cb9..b70b262 100644
+--- a/url/Request.go
++++ b/url/Request.go
+@@ -102,6 +102,10 @@ type Request struct {
+ 	Verify         *bool // nil 表示使用 Session 默认值，使用 url.Bool(true/false) 显式设置
+ 	Cert           []string
+ 	Stream         bool
++	// IsolatedCookies 让本次请求只使用请求自带的 cookie：既不合并也不回写
++	// Session.Cookies。DLL 调用方（Python）每请求都传入完整 cookie 状态，
++	// 需要这个模式；原生 Go Session 的持久 cookie 行为不受影响。
++	IsolatedCookies bool
+ 	Ja3            string
+ 	RandomJA3      *bool // nil 表示使用 Session 默认值，使用 url.Bool(true/false) 显式设置
+ 	ForceHTTP1     *bool // nil 表示使用 Session 默认值，使用 url.Bool(true/false) 显式设置
+diff --git a/url/URL.go b/url/URL.go
+index 87e9626..3080cfe 100644
+--- a/url/URL.go
++++ b/url/URL.go
+@@ -8,6 +8,11 @@ import (
+ // 解析URL
+ func Parse(rawurl string) (*URL, error) {
+ 	p, err := url.Parse(rawurl)
++	if err != nil {
++		// 解析失败时 p 为 nil，不能拼 URL；把错误交给调用方（Prepare_url 等
++		// 会检查并返回），否则这里就是一次空指针崩溃。
++		return nil, err
++	}
+ 	return &URL{
+ 		Scheme:      p.Scheme,
+ 		User:        p.User,
+diff --git a/sessions_lifecycle_test.go b/sessions_lifecycle_test.go
+new file mode 100644
+index 0000000..8a27c07
+--- /dev/null
++++ b/sessions_lifecycle_test.go
+@@ -0,0 +1,174 @@
++package requests
++
++import (
++	"context"
++	"fmt"
++	"net"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++
++	"github.com/wangluozhe/chttp"
++	"github.com/wangluozhe/chttp/httptest"
++	"github.com/wangluozhe/requests/url"
++)
++
++// countingSession returns a session whose base transport counts dials, so
++// connection reuse / release is observable from the test.
++func countingSession(t *testing.T) (*Session, *int64) {
++	t.Helper()
++	session := NewSession()
++	var dials int64
++	dial := session.transport.DialContext
++	session.transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
++		atomic.AddInt64(&dials, 1)
++		return dial(ctx, network, addr)
++	}
++	return session, &dials
++}
++
++func okHandler(w http.ResponseWriter, r *http.Request) {
++	w.Header().Set("Content-Length", "2")
++	w.Write([]byte("ok"))
++}
++
++// A keep-alive connection is reused while the session lives, and Close()
++// releases it so the next request dials a fresh one.
++func TestSessionCloseReleasesIdleConnections(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(okHandler))
++	defer server.Close()
++
++	session, dials := countingSession(t)
++	for i := 0; i < 2; i++ {
++		if _, err := session.Get(server.URL, nil); err != nil {
++			t.Fatalf("request %d: %v", i, err)
++		}
++	}
++	if got := atomic.LoadInt64(dials); got != 1 {
++		t.Fatalf("keep-alive reuse: expected 1 dial, got %d", got)
++	}
++
++	session.Close()
++	session.Close() // idempotent
++	if !session.IsClosed() {
++		t.Fatal("IsClosed() = false after Close()")
++	}
++
++	if _, err := session.Get(server.URL, nil); err != nil {
++		t.Fatalf("request after Close(): %v", err)
++	}
++	if got := atomic.LoadInt64(dials); got != 2 {
++		t.Fatalf("after Close() the idle connection must be gone: expected 2 dials, got %d", got)
++	}
++}
++
++// IsolatedCookies requests neither read nor write Session.Cookies; a plain
++// request still gets the native persistent jar behaviour.
++func TestIsolatedCookiesIgnoreSessionJar(t *testing.T) {
++	var mu sync.Mutex
++	var seen []string
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		seen = append(seen, r.Header.Get("Cookie"))
++		mu.Unlock()
++		w.Header().Set("Set-Cookie", "srv=1; Path=/")
++		w.Header().Set("Content-Length", "2")
++		w.Write([]byte("ok"))
++	}))
++	defer server.Close()
++
++	session := NewSession()
++
++	first := url.NewRequest()
++	first.IsolatedCookies = true
++	first.Cookies = map[string]string{"a": "1"}
++	if _, err := session.Get(server.URL, first); err != nil {
++		t.Fatalf("isolated request 1: %v", err)
++	}
++
++	second := url.NewRequest()
++	second.IsolatedCookies = true
++	if _, err := session.Get(server.URL, second); err != nil {
++		t.Fatalf("isolated request 2: %v", err)
++	}
++
++	third := url.NewRequest()
++	if _, err := session.Get(server.URL, third); err != nil {
++		t.Fatalf("native request 1: %v", err)
++	}
++	fourth := url.NewRequest()
++	if _, err := session.Get(server.URL, fourth); err != nil {
++		t.Fatalf("native request 2: %v", err)
++	}
++
++	mu.Lock()
++	defer mu.Unlock()
++	if len(seen) != 4 {
++		t.Fatalf("expected 4 recorded requests, got %d", len(seen))
++	}
++	if !strings.Contains(seen[0], "a=1") {
++		t.Fatalf("request cookies not sent: %q", seen[0])
++	}
++	if strings.Contains(seen[1], "srv=1") || strings.Contains(seen[1], "a=1") {
++		t.Fatalf("isolated request inherited cookie state: %q", seen[1])
++	}
++	if strings.Contains(seen[2], "srv=1") {
++		t.Fatalf("isolated response must not be stored in the session jar: %q", seen[2])
++	}
++	if !strings.Contains(seen[3], "srv=1") {
++		t.Fatalf("native session jar must persist cookies: %q", seen[3])
++	}
++}
++
++// Send() must not write the default HeadersID into the shared session field.
++func TestSendDoesNotMutateSessionHTTP2Settings(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(okHandler))
++	defer server.Close()
++
++	session := NewSession()
++	session.HTTP2Settings = &http.HTTP2Settings{}
++	if _, err := session.Get(server.URL, nil); err != nil {
++		t.Fatalf("request: %v", err)
++	}
++	if session.HTTP2Settings.HeadersID != 0 {
++		t.Fatalf("Session.HTTP2Settings.HeadersID mutated to %d", session.HTTP2Settings.HeadersID)
++	}
++}
++
++// Concurrent isolated-cookie requests on one session must not share cookie
++// state (run with -race).
++func TestConcurrentIsolatedCookieRequests(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		body := r.Header.Get("Cookie")
++		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
++		w.Write([]byte(body))
++	}))
++	defer server.Close()
++
++	session := NewSession()
++	var wg sync.WaitGroup
++	for worker := 0; worker < 16; worker++ {
++		wg.Add(1)
++		go func(worker int) {
++			defer wg.Done()
++			value := fmt.Sprintf("t%d", worker)
++			want := "tok=" + value
++			for i := 0; i < 20; i++ {
++				request := url.NewRequest()
++				request.IsolatedCookies = true
++				request.Cookies = map[string]string{"tok": value}
++				response, err := session.Get(server.URL, request)
++				if err != nil {
++					t.Errorf("worker %d: %v", worker, err)
++					return
++				}
++				if got := response.Text(); got != want {
++					t.Errorf("worker %d: cookie echo %q, want %q", worker, got, want)
++					return
++				}
++			}
++		}(worker)
++	}
++	wg.Wait()
++}
+diff --git a/libs_dist/probe_exports.go b/libs_dist/probe_exports.go
+new file mode 100644
+index 0000000..e15736e
+--- /dev/null
++++ b/libs_dist/probe_exports.go
+@@ -0,0 +1,39 @@
++//go:build probe
++
++package main
++
++/*
++#include <stdlib.h>
++*/
++import "C"
++
++// 测试专用导出（仅 -tags probe 构建）：用于观察会话 / 流 / C 字符串登记表的
++// 条目数，验证配平。生产 so 用 `go build -buildmode=c-shared export.go` 构建，
++// 不包含本文件的任何符号。
++
++//export probeUnsafePointerCount
++func probeUnsafePointerCount() C.int {
++	unsafePointersLock.Lock()
++	defer unsafePointersLock.Unlock()
++	return C.int(len(unsafePointers))
++}
++
++//export probeStreamCount
++func probeStreamCount() C.int {
++	count := 0
++	streamPool.Range(func(_, _ any) bool {
++		count++
++		return true
++	})
++	return C.int(count)
++}
++
++//export probeSessionCount
++func probeSessionCount() C.int {
++	count := 0
++	sessionsPool.Range(func(_, _ any) bool {
++		count++
++		return true
++	})
++	return C.int(count)
++}

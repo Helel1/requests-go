@@ -166,3 +166,5 @@ try:
     import tls_config
 except ImportError:
     from . import tls_config
+
+from ._build_info import get_build_info

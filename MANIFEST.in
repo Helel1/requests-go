@@ -1,0 +1,17 @@
+include LICENSE
+include LICENSE-GPL-3.0
+include THIRD_PARTY_NOTICES.md
+include README.md
+include CHANGELOG.md
+include pyproject.toml
+include setup.py
+recursive-include docs *.md
+recursive-include patches *.diff *.go
+recursive-include tools *.py
+recursive-include tests *.py
+recursive-include requests_go/tls_client/dependencies *.so *.dll *.dylib
+prune build
+prune requests_go.egg-info
+prune .go-upstream
+prune out
+global-exclude __pycache__ *.py[cod]

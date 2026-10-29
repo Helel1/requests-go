@@ -234,7 +234,13 @@ class Session:
         # ---- Stream mode: use stream_request / stream_read / stream_close ----
         if stream:
             meta, stream_body = open_stream(request_params)
-            return build_stream_response(meta, stream_body)
+            try:
+                return build_stream_response(meta, stream_body)
+            except BaseException:
+                # The stream entry is registered Go-side already; close it so a
+                # failing response build does not leak the body and its conn.
+                stream_body.close()
+                raise
 
         # ---- Normal (non-stream) mode ----
         rs = request(dumps(request_params).encode("utf-8")).decode("utf-8")

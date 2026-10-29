@@ -20,10 +20,13 @@ class TLSHandlerPool(object):
 
 	def __init__(self, tls_factory=TLSRequest, maxsize=1, **kwargs):
 		self._block = kwargs.get("block", False)
+		# 记住工厂与配置：非阻塞且池空时要按需新建 handler。
+		self._tls_factory = tls_factory
+		self._tls_config = kwargs.get("tls_config", None)
 		self._pool = queue.LifoQueue(maxsize)
 
 		for _ in range(maxsize):
-			handler = tls_factory(kwargs.get("tls_config", None))
+			handler = tls_factory(self._tls_config)
 			self._pool.put(handler, block=False)
 
 	def send(self, options):
@@ -63,9 +66,14 @@ class TLSHandlerPool(object):
 			return tls_handler
 
 		except queue.Empty:
-			raise EmptyPool(
-				"Pool reached maximum size and no more connections are allowed."
-			)
+			if self._block:
+				raise EmptyPool(
+					"Pool reached maximum size and no more connections are allowed."
+				)
+			# 池是缓存不是限流器：非阻塞且空时按需新建 handler，超量部分在
+			# 归还时由 put_handler_back 丢弃。旧实现直接抛 EmptyPool，共享
+			# Session 在默认 maxsize=10 下第 11 个并发请求就失败。
+			return self._tls_factory(self._tls_config)
 
 		except AttributeError:
 			raise ClosedPool("Pool is no longer available")
@@ -78,6 +86,9 @@ class TLSHandlerPool(object):
 		"""
 		try:
 			self._pool.put(tls_handler, block=False)
+
+		except queue.Full:
+			pass  # 按需新建的 handler 超出池容量，丢弃即可（它不持有 Go 资源）
 
 		except AttributeError:
 			pass  # Pool was closed

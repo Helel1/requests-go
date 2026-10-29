@@ -160,9 +160,17 @@ def _parse_cookies(cookie_list, parsed_url, cookie_jar):
         if expires_str:
             try:
                 dt = datetime.strptime(expires_str, "%Y-%m-%dT%H:%M:%SZ")
-                expires = calendar.timegm(dt.timetuple())
             except (ValueError, OverflowError):
                 expires = None
+            else:
+                if dt.year <= 1:
+                    # Go 的 http.Cookie 没有 Expires 时序列化成零值时间
+                    # (0001-01-01T00:00:00Z)，只表示"没有过期时间"（会话
+                    # cookie）。真实的历史时间（1970 及更早）必须保留过期
+                    # 语义，不能一起当成会话 cookie。
+                    expires = None
+                else:
+                    expires = calendar.timegm(dt.timetuple())
         secure = cookies["Secure"]
         http_only = cookies["HttpOnly"]
         rest = {"HttpOnly": http_only}

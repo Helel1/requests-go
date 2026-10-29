@@ -12,6 +12,7 @@ from json import dumps, loads
 from .client import stream_request as _stream_request
 from .client import stream_read as _stream_read
 from .client import stream_close as _stream_close
+from .client import freeMemory as _free_memory
 from .exceptions import TLSClientExeption
 
 
@@ -31,6 +32,9 @@ class StreamBody(io.RawIOBase):
         self._closed = False
         # Buffer for leftover data from previous reads
         self._buffer = b""
+        # Read error that arrived together with the last data chunk: the data is
+        # handed to the caller first, the error is raised on the next read.
+        self._pending_error = None
 
     # ---- io.RawIOBase interface ----
 
@@ -45,6 +49,12 @@ class StreamBody(io.RawIOBase):
 
     def read(self, size: int = -1) -> bytes:
         """Read up to *size* bytes.  ``-1`` means read until EOF."""
+        if self._pending_error is not None:
+            error, self._pending_error = self._pending_error, None
+            # 尾块数据已交付过；错误在这里抛出时顺手关闭 Go 侧 entry。
+            self.close()
+            raise TLSClientExeption(error)
+
         if self._closed or self._eof:
             return b""
 
@@ -58,6 +68,11 @@ class StreamBody(io.RawIOBase):
                 chunk = self._read_chunk(65536)
                 if chunk:
                     chunks.append(chunk)
+            if self._pending_error is not None:
+                # read(-1) 承诺读到 EOF：中途出错时不能静默返回截断数据。
+                error, self._pending_error = self._pending_error, None
+                self.close()
+                raise TLSClientExeption(error)
             return b"".join(chunks)
 
         # If we already have enough buffered data, return from buffer
@@ -86,6 +101,8 @@ class StreamBody(io.RawIOBase):
     def close(self):
         if not self._closed:
             self._closed = True
+            # 不清 _pending_error：close() 不应吞掉尚未抛给调用方的读错误，
+            # 之后再 read() 仍会先抛出它。
             try:
                 _stream_close(self._stream_id.encode("utf-8"))
             except Exception:
@@ -103,6 +120,7 @@ class StreamBody(io.RawIOBase):
         if self._eof:
             return b""
 
+        result = None
         try:
             raw = _stream_read(
                 self._stream_id.encode("utf-8"),
@@ -111,11 +129,19 @@ class StreamBody(io.RawIOBase):
             result = loads(raw.decode("utf-8"))
         except Exception as e:
             self._eof = True
+            # DLL 调用或 JSON 解析失败：立刻关闭 Go 侧 entry 与指针，不依赖
+            # 调用方再补一次 close()（close 幂等，重复调用只会 stream_close 一次）。
+            self.close()
             raise TLSClientExeption(f"stream_read failed: {e}")
-
-        if result.get("err"):
-            self._eof = True
-            raise TLSClientExeption(f"stream_read error: {result['err']}")
+        finally:
+            # Hard errors carry a unique id and use the same release path as a
+            # normal response; successful reads are freed by the Go side's
+            # "<stream_id>_read" single slot on the next read or on close.
+            if isinstance(result, dict) and "id" in result:
+                try:
+                    _free_memory(result["id"].encode("utf-8"))
+                except Exception:
+                    pass
 
         data = b""
         if result.get("data"):
@@ -123,6 +149,17 @@ class StreamBody(io.RawIOBase):
 
         if result.get("eof"):
             self._eof = True
+
+        if result.get("err"):
+            # DLL 会把最后一段数据与错误一起返回：先交付数据，错误留到下一次
+            # read()（那时由 read 关闭 entry 并抛出）。
+            error = f"stream_read error: {result['err']}"
+            if data:
+                self._pending_error = error
+            else:
+                self._eof = True
+                self.close()
+                raise TLSClientExeption(error)
 
         return data
 
@@ -143,11 +180,21 @@ def open_stream(request_params: dict):
     request_params["Stream"] = True
     payload = dumps(request_params).encode("utf-8")
 
-    raw = _stream_request(payload)
-    meta = loads(raw.decode("utf-8"))
-
-    if meta.get("err"):
-        raise TLSClientExeption(f"stream_request error: {meta['err']}")
+    meta = None
+    try:
+        raw = _stream_request(payload)
+        meta = loads(raw.decode("utf-8"))
+        if meta.get("err"):
+            raise TLSClientExeption(f"stream_request error: {meta['err']}")
+    finally:
+        # Failed responses carry a unique id and must be released here; a
+        # successful meta is registered under its stream_id and released by
+        # stream_close.
+        if isinstance(meta, dict) and "id" in meta:
+            try:
+                _free_memory(meta["id"].encode("utf-8"))
+            except Exception:
+                pass
 
     stream_id = meta["stream_id"]
     return meta, StreamBody(stream_id)

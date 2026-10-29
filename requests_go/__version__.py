@@ -10,8 +10,8 @@
 
 __title__ = "requests_go"
 __description__ = "Advanced Python HTTP/HTTP2 Client. Support tls/http2/ja3 Fingerprint Custom."
-__version__ = "1.0.10b1"
+__version__ = "1.0.10b2.dev0"
 __author__ = "Lee Gene"
 __license__ = "MIT"
 __author_email__ = "leegene0816@gmail.com"
-__url__ = "https://github.com/wangluozhe/requests-go"
+__url__ = "https://github.com/Helel1/requests-go"

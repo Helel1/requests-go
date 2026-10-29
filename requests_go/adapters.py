@@ -34,7 +34,7 @@ except ImportError:
     from .tls_config.config import TLSConfig
 from .auth import basestring, _basic_auth_str
 from .tls_client.exceptions import TLSClientExeption
-from .pool import TLSHandlerPool
+from .pool import TLSHandlerPool, EmptyPool
 from urllib.parse import urlparse
 from requests.exceptions import (
     ConnectionError,
@@ -555,6 +555,11 @@ class TLSAdapter(BaseAdapter):
             raise ConnectionError(e, request=request)
 
         except ClosedPoolError as e:
+            raise ConnectionError(e, request=request)
+
+        # EmptyPool 现在只在 pool_block=True 时可达，且它不是 requests 的异常
+        # 子类；按连接失败的惯例包成 ConnectionError。
+        except EmptyPool as e:
             raise ConnectionError(e, request=request)
 
         except _ProxyError as e:

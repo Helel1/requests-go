@@ -3,6 +3,26 @@
 **Requests-Go** 是一个为现代网络爬虫和自动化任务而生的、功能强大的Python HTTP客户端库。它巧妙地结合了Python `requests`库的易用性与Go语言底层网络栈的高性能和高可定制性，专门用于解决TLS指纹（如JA3/JA4）识别、HTTP/2自定义以及绕过高级机器人检测等难题。
 
 
+> **维护版状态（maintenance build）**
+>
+> 本仓库维护版为 **Linux x86_64 (amd64)** 构建：内核库由用户自有 Go fork
+> [`Helel1/requests`](https://github.com/Helel1/requests) 的固定 commit
+> `8ddcf6496005c5cb9acaf3f18d38159b7ef43269` 编译而成（fork 自上游 `wangluozhe/requests`
+> `46ef52b`，修复已作为 commit 存在于该 fork），Python 版本 `1.0.10b2.dev0`，wheel 平台标记
+> `py3-none-linux_x86_64`。仓库中其它平台的旧二进制（macOS x86_64/arm64、Windows x64、
+> Linux arm64）保持原样、本轮未重建。
+>
+> 运行时可查看 Python 版本、实际加载的库路径与内核构建来源：
+>
+> ```python
+> import requests_go
+> print(requests_go.get_build_info())
+> ```
+>
+> 构建/复现流程与内核来源更新方式见 [docs/maintenance.md](./docs/maintenance.md)，变更见 [CHANGELOG.md](./CHANGELOG.md)。
+> 本维护版不从源码树直接打包，wheel 只能由 `tools/build_go_lib.py` 生成的 build stage 构建。
+
+
 ## 核心特性
 
   - **动态TLS指纹模拟**: 内置多种主流浏览器（Chrome, Firefox, Safari, Edge）的TLS指纹配置，只需一行代码即可切换。

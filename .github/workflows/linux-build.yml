@@ -1,0 +1,89 @@
+name: linux-build
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      GO_SOURCE_DIR: ${{ github.workspace }}/.go-upstream
+      OUTPUT_DIR: ${{ github.workspace }}/out
+      VENV_DIR: ${{ runner.temp }}/rg-venv
+    steps:
+      - name: Checkout Python package
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned Go source fork
+        uses: actions/checkout@v4
+        with:
+          repository: Helel1/requests
+          ref: 8ddcf6496005c5cb9acaf3f18d38159b7ef43269
+          path: .go-upstream
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.0'
+          cache: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install packaging tools
+        run: python -m pip install --upgrade "setuptools>=70.1" build
+
+      - name: Build kernel library, source snapshot and wheel
+        run: python -m tools.build_go_lib "$GO_SOURCE_DIR" "$OUTPUT_DIR"
+
+      - name: Go regression tests on the fork source
+        run: |
+          cd "$OUTPUT_DIR/go-src"
+          go test -race -count=1 -v .
+
+      - name: Install the wheel and its dependencies into an isolated venv
+        run: |
+          python -m venv "$VENV_DIR"
+          "$VENV_DIR/bin/python" -m pip install --upgrade pip "setuptools>=70.1"
+          "$VENV_DIR/bin/python" -m pip install "$OUTPUT_DIR"/dist/*.whl
+
+      - name: Python regression tests against the freshly built library
+        run: |
+          cd "$OUTPUT_DIR/stage"
+          "$VENV_DIR/bin/python" -m unittest discover -s tests -v
+
+      - name: Source tree packaging guard
+        run: |
+          "$VENV_DIR/bin/python" -m unittest discover -s tests -p "test_build_tool.py" -v
+
+      - name: Installed wheel smoke test outside the source tree
+        run: |
+          cd "$RUNNER_TEMP"
+          "$VENV_DIR/bin/python" "$GITHUB_WORKSPACE/tests/installed_wheel_smoke.py"
+
+      - name: Check wheel metadata
+        run: |
+          unzip -p "$OUTPUT_DIR"/dist/*.whl '*/WHEEL'
+          test "$(unzip -p "$OUTPUT_DIR"/dist/*.whl '*/WHEEL' | grep -c '^Tag: py3-none-linux_x86_64$')" = "1"
+          test "$(unzip -p "$OUTPUT_DIR"/dist/*.whl '*/WHEEL' | grep -c '^Root-Is-Purelib: false$')" = "1"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: requests-go-linux-amd64
+          path: |
+            out/dist/*.whl
+            out/dist/*.tar.gz
+            out/requests-go-src-*.tar.gz
+            out/build_info.json
+            docs/maintenance.md
+            CHANGELOG.md
+          if-no-files-found: error

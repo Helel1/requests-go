@@ -118,10 +118,16 @@ class Session(requests.Session):
         # session id
         self.__id = str(uuid.uuid4())
 
-        # session is freed
+        # session is freed / closed
         self.__freed = False
+        self.__closed = False
+        self.__lifecycle_lock = threading.Lock()
 
         # Default connection adapters.
+        self._init_adapters()
+
+    def _init_adapters(self):
+        """(重新)建立默认 adapters；close() 之后再次请求时也走这里。"""
         self.adapters = OrderedDict()
         if self._tls_config.ja3:
             self.mount("https://", TLSAdapter(tls_config=self.tls_config))
@@ -210,6 +216,9 @@ class Session(requests.Session):
         :param tls_config: (optional) Dictionary, tls-client config params. If None, random tls. Default None.
         :rtype: requests.Response
         """
+        if self.__closed:
+            self._reopen()
+
         def _ensure_https_adapter(adapter):
             current = self.adapters.get("https://")
             if type(current) is type(adapter):
@@ -224,9 +233,16 @@ class Session(requests.Session):
 
         if url.startswith("https://") and tls_config:
             _tls_config = self._clone_tls_config(tls_config)
+            # _clone_tls_config() 丢掉 id（TLSConfig.fromJSON 跳过 "id"），
+            # 会把 Go 会话注册到一个新 uuid 上，而 __exit__/__del__ 释放的是
+            # 本 Session 的 uuid —— 于是每个 Session 泄漏一个 Go 会话。把
+            # clone 绑回本 Session 的 id，释放路径才对得上，同一 Session 的
+            # 请求也共享一个 Go 会话（连接复用）。
+            _tls_config.id = self.__id
             _ensure_https_adapter(TLSAdapter(tls_config=_tls_config))
         elif url.startswith("https://") and str(self.tls_config.ja3) != "None":
             _tls_config = self._clone_tls_config(self.tls_config)
+            _tls_config.id = self.__id
             _ensure_https_adapter(TLSAdapter(tls_config=_tls_config))
         else:
             _ensure_https_adapter(HTTPAdapter())
@@ -268,13 +284,37 @@ class Session(requests.Session):
             freeSession(ctypes.c_char_p(self.__id.encode()))
             self.__freed = True  # <--- 执行后立即更新标志位
 
+    def _reopen(self):
+        """close() 之后再请求：重建 adapters 并复位释放状态。
+
+        close() 已经关掉了 TLSHandlerPool 并释放了 Go 会话；只把 freed 复位
+        然后复用那个已关闭的池，请求会拿到 ClosedPool。这里重建 adapters，让
+        下一次请求重新申请可释放的资源（Go 侧按 id 惰性重建会话）。
+        """
+        with self.__lifecycle_lock:
+            if not self.__closed:
+                return
+            self.__closed = False
+            self.__freed = False
+            self._init_adapters()
+
+    def close(self):
+        """关闭连接池并释放 Go 会话。重复调用幂等；之后再请求会重建资源。"""
+        with self.__lifecycle_lock:
+            if self.__closed:
+                return
+            self.__closed = True
+        try:
+            super().close()
+        finally:
+            self.__free_session()
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
-        self.__free_session()
 
     def __del__(self):
         try:
-            self.__free_session()
+            self.close()
         except Exception:
             pass
 
@@ -282,11 +322,8 @@ class Session(requests.Session):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        def _cleanup():
-            self.close()
-            self.__free_session()
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _cleanup)
+        await loop.run_in_executor(None, self.close)
 
 
 class AsyncSession(Session):
